@@ -868,3 +868,65 @@ contribute a new lexer, but you might find it useful in any case.
          (r'[^*]+', Comment.Multiline),
          (r'\*', Comment.Multiline),
      ]
+
+Segmented lexing
+================
+
+.. versionadded:: 2.19
+
+For applications that read source code in chunks (such as log editors),
+:class:`RegexLexer <pygments.lexer.RegexLexer>` provides a
+:meth:`~pygments.lexer.RegexLexer.lex_segment` method that processes one
+chunk at a time and returns the tokens for that chunk along with a
+checkpoint that can be used to resume lexing with the next chunk.
+
+**Conditions for segmented lexing:**
+
+* The lexer must subclass :class:`RegexLexer` directly (not
+  :class:`ExtendedRegexLexer`).
+* The lexer must **not** override
+  :meth:`~pygments.lexer.RegexLexer.get_tokens_unprocessed`. Lexers that
+  override this method are rejected because their state cannot be safely
+  recovered.
+* The caller must split the source at clear line boundaries (i.e., each
+  chunk ends right after a newline character).
+* Cross-line strings, comments, and nested states are handled
+  automatically via the checkpoint.
+
+**Short demo:**
+
+.. code-block:: python
+
+   from pygments.lexer import RegexLexer
+   from pygments.token import String, Comment, Text
+
+   class MyLexer(RegexLexer):
+       tokens = {
+           'root': [
+               ('a', Text),
+               ('"', String, 'string'),
+               ('#', Comment, 'comment'),
+           ],
+           'string': [
+               ('"', String, '#pop'),
+               ('[^"]+', String),
+           ],
+           'comment': [
+               ('\n', Comment, '#pop'),
+               ('[^\n]+', Comment),
+           ],
+       }
+
+   lexer = MyLexer()
+   lines = ['a"hello\n', 'world\n', 'end"\n']
+   checkpoint = None
+   for line in lines:
+       tokens, checkpoint = lexer.lex_segment(line, checkpoint)
+       for pos, tok, val in tokens:
+           print(f'{pos}: {tok} {val!r}')
+
+The checkpoint carries the state stack, absolute position, and any pending
+text. Token positions are absolute offsets into the original source, so
+they do not reset across segments. The checkpoint is bound to the lexer
+type and config; using it with a different lexer type or config raises an
+error.

@@ -62,6 +62,7 @@ There are several base classes derived from ``Lexer`` you can use to build your
 lexer from:
 
 .. autoclass:: pygments.lexer.RegexLexer
+   :members: lex_segment
 .. autoclass:: pygments.lexer.ExtendedRegexLexer
 .. autoclass:: pygments.lexer.DelegatingLexer
 

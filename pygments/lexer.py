@@ -664,6 +664,59 @@ class RegexLexerMeta(LexerMeta):
         return type.__call__(cls, *args, **kwds)
 
 
+class LexerCheckpointError(Exception):
+    """Base class for checkpoint errors."""
+
+
+class LexerTypeMismatchError(LexerCheckpointError):
+    """Raised when a checkpoint is used with a different lexer type."""
+
+
+class LexerConfigMismatchError(LexerCheckpointError):
+    """Raised when a checkpoint is used with a lexer having different config."""
+
+
+class LexerStateError(LexerCheckpointError):
+    """Raised when a checkpoint contains an invalid or unsafe state."""
+
+
+class RegexLexerCheckpoint:
+    """
+    A checkpoint for segmented lexing with `RegexLexer`.
+
+    Holds the state needed to resume lexing from a line boundary:
+
+    ``statestack``
+        Current state stack (tuple of state name strings).
+    ``pos``
+        Absolute position (end of the last chunk).
+    ``pending``
+        Text consumed in the current state but not yet emitted, or None.
+    ``lexer_id``
+        Identifier of the lexer class (module + qualname).
+    ``config_hash``
+        Hash of the lexer options.
+
+    The checkpoint is bound to the lexer type and config. Using a checkpoint
+    with a different lexer type or config raises an error. The checkpoint
+    does *not* store the entire source history -- only the current state
+    stack, absolute position, and a small pending text buffer.
+    """
+    __slots__ = ('statestack', 'pos', 'pending', 'lexer_id', 'config_hash')
+
+    def __init__(self, statestack, pos, pending, lexer_id, config_hash):
+        self.statestack = tuple(statestack)
+        self.pos = pos
+        self.pending = pending
+        self.lexer_id = lexer_id
+        self.config_hash = config_hash
+
+    def __repr__(self):
+        return (f'RegexLexerCheckpoint(statestack={self.statestack!r}, '
+                f'pos={self.pos!r}, pending={self.pending!r}, '
+                f'lexer_id={self.lexer_id!r}, config_hash={self.config_hash!r})')
+
+
 class RegexLexer(Lexer, metaclass=RegexLexerMeta):
     """
     Base for simple stateful regular expression-based lexers.
@@ -759,6 +812,204 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
                     pos += 1
                 except IndexError:
                     break
+
+    def _lexer_id(self):
+        """Return a unique identifier for this lexer class."""
+        cls = type(self)
+        return f'{cls.__module__}.{cls.__qualname__}'
+
+    def _config_hash(self):
+        """Return a hash of the lexer options that affect tokenization."""
+        import hashlib
+        # 'filters' doesn't affect get_tokens_unprocessed, exclude it.
+        options = {k: repr(v) for k, v in self.options.items()
+                   if k != 'filters'}
+        items = sorted(options.items())
+        data = repr(items).encode('utf-8')
+        return hashlib.md5(data).hexdigest()
+
+    def lex_segment(self, chunk, checkpoint=None):
+        """
+        Lex a segment of source text and return tokens plus a checkpoint.
+
+        This method supports segmented/streaming lexing for log editors that
+        read source code in chunks. Each call processes one chunk and returns
+        the tokens for that chunk along with a checkpoint that can be used to
+        resume lexing with the next chunk.
+
+        **Important:** Only call this method at clear line boundaries. The
+        caller is responsible for splitting the source into chunks that end
+        at line boundaries (i.e., right after a newline character).
+
+        Cross-line strings, comments, and nested states are handled
+        automatically: the checkpoint carries the state stack and any pending
+        text, so tokens that span chunk boundaries are correctly continued.
+
+        Absolute token offsets are maintained across segments: the returned
+        token positions are absolute offsets into the original source, not
+        relative to the chunk.
+
+        The checkpoint is bound to the lexer type and config. Using a
+        checkpoint with a different lexer type or config raises an error.
+
+        Lexers that override ``get_tokens_unprocessed`` (including
+        ``ExtendedRegexLexer`` and its subclasses) are rejected because
+        their state cannot be safely recovered for segmented lexing.
+
+        Returns a tuple ``(tokens, checkpoint)`` where ``tokens`` is a list
+        of ``(abs_pos, tokentype, value)`` tuples and ``checkpoint`` is a
+        `RegexLexerCheckpoint` for resuming with the next chunk.
+        """
+        # Reject lexers that override get_tokens_unprocessed, since their
+        # state cannot be safely recovered for segmented lexing. This includes
+        # ExtendedRegexLexer and its subclasses, as well as any lexer that
+        # post-processes tokens in an unsafe way.
+        if type(self).get_tokens_unprocessed is not RegexLexer.get_tokens_unprocessed:
+            raise LexerStateError(
+                f'{self._lexer_id()} overrides get_tokens_unprocessed, '
+                'which cannot be safely recovered for segmented lexing.')
+
+        # Validate the checkpoint if provided.
+        if checkpoint is not None:
+            if not isinstance(checkpoint, RegexLexerCheckpoint):
+                raise LexerStateError(
+                    f'Expected a RegexLexerCheckpoint, got {type(checkpoint).__name__}.')
+            if checkpoint.lexer_id != self._lexer_id():
+                raise LexerTypeMismatchError(
+                    f'Checkpoint was created for {checkpoint.lexer_id!r}, '
+                    f'but this lexer is {self._lexer_id()!r}.')
+            if checkpoint.config_hash != self._config_hash():
+                raise LexerConfigMismatchError(
+                    'Checkpoint config does not match this lexer config.')
+            for state in checkpoint.statestack:
+                if state not in self._tokens:
+                    raise LexerStateError(
+                        f'Checkpoint contains unknown state {state!r}.')
+
+        # Determine the starting state stack and pending text.
+        if checkpoint is None:
+            # Start from root, no pending text.
+            statestack = [('root', None)]
+            pending = None
+            combined = chunk
+            combined_start_abs = 0
+        else:
+            # Restore the state stack from the checkpoint.
+            statestack = []
+            for state in checkpoint.statestack:
+                if state == 'root':
+                    statestack.append((state, None))
+                else:
+                    # The top non-root state was entered at the start of
+                    # the combined text (position 0).
+                    statestack.append((state, 0))
+            pending = checkpoint.pending
+            if pending:
+                combined = pending + chunk
+                combined_start_abs = checkpoint.pos - len(pending)
+            else:
+                combined = chunk
+                combined_start_abs = checkpoint.pos
+
+        # Lex the combined text using the base RegexLexer loop. This gives us
+        # both the state tracking and the base tokens.
+        pos = 0
+        base_tokens = []
+        tokendefs = self._tokens
+        statetokens = tokendefs[statestack[-1][0]]
+
+        while True:
+            for rexmatch, action, new_state in statetokens:
+                m = rexmatch(combined, pos)
+                if m:
+                    if action is not None:
+                        if type(action) is _TokenType:
+                            base_tokens.append((combined_start_abs + pos,
+                                                 action, m.group()))
+                        else:
+                            for item in action(self, m):
+                                base_tokens.append((combined_start_abs + item[0],
+                                                    item[1], item[2]))
+                    pos = m.end()
+                    if new_state is not None:
+                        # State transition.
+                        if isinstance(new_state, tuple):
+                            for state in new_state:
+                                if state == '#pop':
+                                    if len(statestack) > 1:
+                                        statestack.pop()
+                                        # The new top state became the
+                                        # current state at this position.
+                                        if len(statestack) > 1:
+                                            statestack[-1] = (
+                                                statestack[-1][0], pos)
+                                elif state == '#push':
+                                    statestack.append(
+                                        (statestack[-1][0], pos))
+                                else:
+                                    statestack.append((state, pos))
+                        elif isinstance(new_state, int):
+                            if abs(new_state) >= len(statestack):
+                                del statestack[1:]
+                            else:
+                                del statestack[new_state:]
+                            # The new top state became the current state
+                            # at this position.
+                            if len(statestack) > 1:
+                                statestack[-1] = (statestack[-1][0], pos)
+                        elif new_state == '#push':
+                            statestack.append((statestack[-1][0], pos))
+                        else:
+                            assert False, f"wrong state def: {new_state!r}"
+                        statetokens = tokendefs[statestack[-1][0]]
+                    break
+            else:
+                # No match on any state token.
+                try:
+                    if combined[pos] == '\n':
+                        # At EOL, reset state to "root".
+                        statestack = [('root', None)]
+                        statetokens = tokendefs['root']
+                        base_tokens.append((combined_start_abs + pos,
+                                            Whitespace, '\n'))
+                        pos += 1
+                        continue
+                    base_tokens.append((combined_start_abs + pos,
+                                        Error, combined[pos]))
+                    pos += 1
+                except IndexError:
+                    break
+
+        # Tokens come from the base RegexLexer loop above. Lexers that
+        # override get_tokens_unprocessed are rejected at the start of
+        # this method, so base_tokens is always the correct token stream.
+        tokens = base_tokens
+
+        # Determine the new pending text and filter tokens.
+        if statestack[-1][0] == 'root':
+            # Back at root: no pending text.
+            new_pending = None
+            emit_tokens = tokens
+        else:
+            # Still in a non-root state: hold back text consumed in the
+            # current state.
+            entry_pos = statestack[-1][1]
+            new_pending = combined[entry_pos:]
+            # Emit only tokens that were consumed before the current state
+            # was entered.
+            emit_tokens = [t for t in tokens
+                           if t[0] < combined_start_abs + entry_pos]
+
+        # Create the new checkpoint.
+        new_checkpoint = RegexLexerCheckpoint(
+            statestack=[s for s, _ in statestack],
+            pos=combined_start_abs + len(combined),
+            pending=new_pending,
+            lexer_id=self._lexer_id(),
+            config_hash=self._config_hash(),
+        )
+
+        return emit_tokens, new_checkpoint
 
 
 class LexerContext:
