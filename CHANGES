@@ -7,6 +7,13 @@ Version 2.22.0
 --------------
 (not released yet)
 
+- Added a chunked (incremental) lexing interface to ``RegexLexer``:
+  ``lex_chunk()`` and ``start_chunked()`` lex a document piece by piece
+  (cut at line boundaries) and return a resumable ``LexerCheckpoint``
+  with absolute token offsets.  Checkpoints are bound to the lexer class
+  and options; misuse raises the new ``CheckpointError`` subclasses
+  ``CheckpointMismatchError`` and ``CheckpointUnsupportedError``.
+
 Version 2.21.0
 ---------------
 (released August 17th, 2026)

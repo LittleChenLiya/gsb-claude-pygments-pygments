@@ -66,6 +66,78 @@ lexer from:
 .. autoclass:: pygments.lexer.DelegatingLexer
 
 
+Chunked (incremental) lexing
+============================
+
+Applications like log viewers and editors often cannot re-lex the whole
+document on every change.  For them, `pygments.lexer.RegexLexer` offers an
+explicit chunked interface: you feed the source one piece at a time and carry
+an opaque `~pygments.lexer.LexerCheckpoint` between calls.
+
+.. automethod:: pygments.lexer.RegexLexer.lex_chunk
+.. automethod:: pygments.lexer.RegexLexer.start_chunked
+.. autoclass:: pygments.lexer.LexerCheckpoint
+
+The following exceptions are raised by the chunked interface:
+
+.. autoexception:: pygments.lexer.CheckpointError
+.. autoexception:: pygments.lexer.CheckpointMismatchError
+.. autoexception:: pygments.lexer.CheckpointUnsupportedError
+
+Rules and guarantees:
+
+* Chunks must be cut at explicit line boundaries (every chunk except the
+  last one must end with ``'\n'``); the last chunk may be unterminated if
+  ``final=True`` is passed.
+* Multi-line strings, comments and nested states are carried over via the
+  checkpoint's state stack, and token offsets are absolute -- they are
+  never reset between chunks.
+* A token spanning a chunk boundary is emitted once per chunk; merging
+  adjacent tokens of the same type yields exactly the token stream of
+  one-shot lexing.
+* A checkpoint is bound to the lexer class *and* its options.  Resuming it
+  with a different lexer or different options raises
+  `~pygments.lexer.CheckpointMismatchError`.  Checkpoints are picklable
+  and contain no source text, so they stay small.
+
+A lexer supports checkpointing if all of the following hold:
+
+* it is a plain `~pygments.lexer.RegexLexer` subclass (not
+  `~pygments.lexer.ExtendedRegexLexer` or
+  `~pygments.lexer.DelegatingLexer`),
+* it does not override ``get_tokens_unprocessed()`` with custom logic
+  (lexers doing so are rejected with
+  `~pygments.lexer.CheckpointUnsupportedError`),
+* it does not set ``supports_checkpoints = False`` (lexers whose token
+  actions keep hidden state in instance attributes should set this),
+* its multi-line constructs (strings, comments) are modeled with lexer
+  *states*, as is the case for the built-in Python, Rust and many other
+  lexers.  Rules whose regular expressions themselves match across line
+  boundaries (e.g. line-continuation handling or single-regex multi-line
+  comments) are outside the equivalence guarantee.
+
+Short demo:
+
+.. code-block:: python
+
+    from pygments.lexers import PythonLexer
+
+    lines = ['x = """hello\n', 'world"""\n', 'print(x)\n']
+
+    lexer = PythonLexer()
+    checkpoint = None
+    for i, line in enumerate(lines):
+        tokens, checkpoint = lexer.lex_chunk(line, checkpoint)
+        # tokens: list of (absolute_offset, tokentype, value)
+        print(tokens)
+
+    # A checkpoint can be saved and resumed by a fresh lexer instance:
+    lexer_a = PythonLexer()
+    _, checkpoint = lexer_a.lex_chunk(lines[0])
+    lexer_b = PythonLexer()
+    tokens, checkpoint = lexer_b.lex_chunk(lines[1], checkpoint)
+
+
 .. module:: pygments.formatter
 
 Formatters

@@ -20,7 +20,9 @@ from pygments.util import get_bool_opt, get_int_opt, get_list_opt, \
 from pygments.regexopt import regex_opt
 
 __all__ = ['Lexer', 'RegexLexer', 'ExtendedRegexLexer', 'DelegatingLexer',
-           'LexerContext', 'include', 'inherit', 'bygroups', 'using', 'this',
+           'LexerContext', 'LexerCheckpoint', 'CheckpointError',
+           'CheckpointMismatchError', 'CheckpointUnsupportedError',
+           'include', 'inherit', 'bygroups', 'using', 'this',
            'default', 'words', 'line_re']
 
 line_re = re.compile('.*?\n')
@@ -664,6 +666,75 @@ class RegexLexerMeta(LexerMeta):
         return type.__call__(cls, *args, **kwds)
 
 
+#: Version of the `LexerCheckpoint` format.  Checkpoints created by a
+#: different format version are rejected when resumed.
+_CHECKPOINT_VERSION = 1
+
+
+class CheckpointError(Exception):
+    """
+    Base class for errors raised by the chunked lexing interface
+    (`RegexLexer.lex_chunk`).
+    """
+
+
+class CheckpointMismatchError(CheckpointError):
+    """
+    Raised when a `LexerCheckpoint` is passed to a lexer it was not
+    created for -- a different lexer class, different lexer options, or
+    an incompatible checkpoint format version.
+    """
+
+
+class CheckpointUnsupportedError(CheckpointError):
+    """
+    Raised when a lexer cannot create or resume checkpoints because its
+    state cannot be captured safely, e.g. it overrides
+    ``get_tokens_unprocessed`` with custom logic or sets
+    ``supports_checkpoints = False``.
+    """
+
+
+class LexerCheckpoint:
+    """
+    An opaque snapshot of a `RegexLexer`'s state at a line boundary,
+    returned by `RegexLexer.lex_chunk` and `RegexLexer.start_chunked`.
+
+    A checkpoint captures only the absolute offset in the document and
+    the lexer's state stack -- it deliberately does *not* store any of
+    the source text, so it stays small no matter how large the document
+    is.  It is bound to the lexer class and options it was created with;
+    passing it to a different lexer (or the same lexer class with
+    different options) raises `CheckpointMismatchError`.
+
+    Checkpoints are picklable, so they can be saved and resumed in a
+    later session or by a freshly created lexer instance.
+    """
+
+    __slots__ = ('lexer_key', 'pos', 'stack', 'version')
+
+    def __init__(self, lexer_key, pos, stack, version=_CHECKPOINT_VERSION):
+        #: Identifies the lexer class and options this checkpoint is bound to.
+        self.lexer_key = lexer_key
+        #: Absolute offset in the document where lexing resumes.
+        self.pos = pos
+        #: The state stack (tuple of state names) at that position.
+        self.stack = stack
+        #: Checkpoint format version.
+        self.version = version
+
+    def __eq__(self, other):
+        return (isinstance(other, LexerCheckpoint) and
+                self.lexer_key == other.lexer_key and
+                self.pos == other.pos and
+                self.stack == other.stack and
+                self.version == other.version)
+
+    def __repr__(self):
+        return (f'LexerCheckpoint(lexer={self.lexer_key[0]!r}, '
+                f'pos={self.pos!r}, stack={self.stack!r})')
+
+
 class RegexLexer(Lexer, metaclass=RegexLexerMeta):
     """
     Base for simple stateful regular expression-based lexers.
@@ -699,15 +770,31 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
     #: current one.
     tokens = {}
 
+    #: Set to ``False`` in subclasses whose token actions carry hidden
+    #: state across lines (e.g. instance attributes mutated by callback
+    #: actions) that a `LexerCheckpoint` cannot capture.  `lex_chunk`
+    #: will then refuse to run with `CheckpointUnsupportedError`.
+    supports_checkpoints = True
+
     def get_tokens_unprocessed(self, text, stack=('root',)):
         """
         Split ``text`` into (tokentype, text) pairs.
 
         ``stack`` is the initial stack (default: ``['root']``)
         """
+        yield from self._lex_tokens(text, list(stack))
+
+    def _lex_tokens(self, text, statestack):
+        """
+        Core lexing loop shared by `get_tokens_unprocessed` and `lex_chunk`.
+
+        Yields ``(pos, tokentype, value)`` triples where ``pos`` is relative
+        to the start of ``text``.  ``statestack`` must be a list of state
+        names; it is updated in place while lexing, so when the generator
+        is exhausted it holds the state the lexer ended in.
+        """
         pos = 0
         tokendefs = self._tokens
-        statestack = list(stack)
         statetokens = tokendefs[statestack[-1]]
         while 1:
             for rexmatch, action, new_state in statetokens:
@@ -750,7 +837,7 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
                 try:
                     if text[pos] == '\n':
                         # at EOL, reset state to "root"
-                        statestack = ['root']
+                        statestack[:] = ['root']
                         statetokens = tokendefs['root']
                         yield pos, Whitespace, '\n'
                         pos += 1
@@ -759,6 +846,89 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
                     pos += 1
                 except IndexError:
                     break
+
+    def _checkpoint_key(self):
+        """
+        Return a key identifying this lexer's class and configuration.
+        Checkpoints are bound to this key.
+        """
+        options = repr(sorted((k, repr(v)) for k, v in self.options.items()))
+        return (f'{type(self).__module__}.{type(self).__qualname__}', options)
+
+    def _check_checkpoint_support(self):
+        cls = type(self)
+        if cls.get_tokens_unprocessed is not RegexLexer.get_tokens_unprocessed:
+            raise CheckpointUnsupportedError(
+                f'{cls.__name__} overrides get_tokens_unprocessed() with '
+                f'custom logic, so its lexer state cannot be captured in a '
+                f'checkpoint safely')
+        if not self.supports_checkpoints:
+            raise CheckpointUnsupportedError(
+                f'{cls.__name__} declares supports_checkpoints = False; its '
+                f'token actions carry state that a checkpoint cannot capture')
+
+    def start_chunked(self):
+        """
+        Return the initial `LexerCheckpoint` for a fresh chunked lexing
+        session.  Equivalent to (but cheaper than) calling `lex_chunk`
+        with ``checkpoint=None`` and inspecting the returned checkpoint.
+        """
+        self._check_checkpoint_support()
+        return LexerCheckpoint(self._checkpoint_key(), 0, ('root',))
+
+    def lex_chunk(self, text, checkpoint=None, final=False):
+        """
+        Lex one chunk of a document and return ``(tokens, checkpoint)``.
+
+        ``tokens`` is a list of ``(index, tokentype, value)`` triples where
+        ``index`` is the *absolute* offset within the whole document --
+        offsets are never reset between chunks.  ``checkpoint`` is a
+        `LexerCheckpoint` that must be passed to the next call, possibly
+        on a freshly created lexer instance, as long as it is the same
+        lexer class with the same options (otherwise
+        `CheckpointMismatchError` is raised).  If ``final`` is true, the
+        returned checkpoint is ``None``.
+
+        Chunks must be cut at explicit line boundaries: unless ``final``
+        is true, ``text`` must end with ``'\\n'`` (`CheckpointError` is
+        raised otherwise).  Multi-line strings, comments and nested
+        states simply continue in the next chunk via the checkpoint.
+
+        Unlike `get_tokens`, no input preprocessing (``stripnl``,
+        ``ensurenl``, tab expansion, ...) is applied to chunks; pass the
+        text exactly as it appears in the document.
+
+        A token that spans a chunk boundary (e.g. a multi-line string)
+        is emitted as one token per chunk; concatenating adjacent tokens
+        of the same type yields the same token stream as lexing the
+        whole document at once.
+        """
+        self._check_checkpoint_support()
+        if checkpoint is None:
+            checkpoint = self.start_chunked()
+        elif not isinstance(checkpoint, LexerCheckpoint):
+            raise CheckpointError(
+                f'expected a LexerCheckpoint or None, got '
+                f'{type(checkpoint).__name__}')
+        if checkpoint.version != _CHECKPOINT_VERSION or \
+                checkpoint.lexer_key != self._checkpoint_key():
+            raise CheckpointMismatchError(
+                f'checkpoint was created for {checkpoint.lexer_key[0]} '
+                f'(format version {checkpoint.version}) and cannot be '
+                f'resumed by {type(self).__name__} with the current options')
+        if not final and not text.endswith('\n'):
+            raise CheckpointError(
+                'chunks must be split at explicit line boundaries: this '
+                'chunk does not end with a newline (pass final=True for '
+                'the last chunk of a document)')
+        statestack = list(checkpoint.stack)
+        base = checkpoint.pos
+        tokens = [(base + pos, tokentype, value)
+                  for pos, tokentype, value in self._lex_tokens(text, statestack)]
+        if final:
+            return tokens, None
+        return tokens, LexerCheckpoint(self._checkpoint_key(),
+                                       base + len(text), tuple(statestack))
 
 
 class LexerContext:
