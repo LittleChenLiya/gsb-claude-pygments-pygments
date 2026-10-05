@@ -12,7 +12,7 @@
 import re
 
 from pygments.token import String, Comment, Keyword, Name, Error, Whitespace, \
-    string_to_tokentype
+    Text, string_to_tokentype
 from pygments.filter import Filter
 from pygments.util import get_list_opt, get_int_opt, get_bool_opt, \
     get_choice_opt, ClassNotFound, OptionError
@@ -930,6 +930,185 @@ class TokenMergeFilter(Filter):
             yield current_type, current_value
 
 
+class TokenStreamMasker(Filter):
+    """Mask source character ranges in a token stream.
+
+    This filter replaces the text of tokens that fall within the given
+    source character ranges with a replacement string, while preserving
+    the token types of the unmasked outer parts.  A mapping from output
+    offsets back to the original source offsets is recorded in the
+    `mapping` attribute after the filter has been consumed.
+
+    The ranges are absolute character offsets into the source text (the
+    concatenation of all token values).  They are sorted automatically,
+    checked for overlap and boundary validity, and must not split a
+    Unicode surrogate pair.  Empty ranges are accepted and have no
+    effect.
+
+    The filter buffers the whole stream so that all validation happens
+    before any output is produced: errors never deliver partial masking.
+    The original token values are not modified.
+
+    Options accepted:
+
+    `ranges` : list of (start, end) tuples
+       The source character ranges to mask.  Offsets are absolute
+       character offsets into the source text.  The ranges are sorted
+       automatically and must not overlap.  There is no default.
+
+    `replacement` : string
+       The text to replace masked ranges with.  Its length may differ
+       from the length of a masked range.  The default is ``'***'``.
+
+    `mask_ttype` : TokenType
+       The token type to give the replacement text.  The default is
+       `Token.Text`.
+
+    After the filter has been consumed, the `mapping` attribute holds a
+    list of ``(out_start, out_end, src_start, src_end, ttype)`` tuples,
+    each mapping a contiguous output segment to its original source
+    range.  For masked segments, the source range is the masked range;
+    for plain segments, it is the original source range.
+
+    Example::
+
+        >>> from pygments import lex
+        >>> from pygments.lexers import PythonLexer
+        >>> from pygments.filters import TokenStreamMasker
+        >>> tokens = list(lex('secret = 42', PythonLexer()))
+        >>> masker = TokenStreamMasker(ranges=[(0, 6)], replacement='***')
+        >>> list(masker.filter(None, tokens))
+        [(Token.Text, '***'), (Token.Text.Whitespace, ' '), (Token.Operator, '='), (Token.Text.Whitespace, ' '), (Token.Literal.Number.Integer, '42'), (Token.Text.Whitespace, '\\n')]
+        >>> masker.mapping
+        [(0, 3, 0, 6, Token.Text), (3, 4, 6, 7, Token.Text.Whitespace), (4, 5, 7, 8, Token.Operator), (5, 6, 8, 9, Token.Text.Whitespace), (6, 8, 9, 11, Token.Literal.Number.Integer), (8, 9, 11, 12, Token.Text.Whitespace)]
+    """
+
+    def __init__(self, **options):
+        Filter.__init__(self, **options)
+        self.ranges = options.get('ranges') or []
+        self.replacement = options.get('replacement', '***')
+        self.mask_ttype = options.get('mask_ttype', Text)
+        self.mapping = []
+
+    @staticmethod
+    def _is_high_surrogate(ch):
+        return 0xD800 <= ord(ch) <= 0xDBFF
+
+    @staticmethod
+    def _is_low_surrogate(ch):
+        return 0xDC00 <= ord(ch) <= 0xDFFF
+
+    @classmethod
+    def _splits_surrogate_pair(cls, source, pos):
+        """Return True if ``pos`` falls between a surrogate pair in ``source``."""
+        if pos <= 0 or pos >= len(source):
+            return False
+        return cls._is_high_surrogate(source[pos - 1]) and \
+            cls._is_low_surrogate(source[pos])
+
+    def _validate_ranges(self, ranges, source):
+        """Sort and validate ranges against ``source``.
+
+        Returns the sorted list of non-empty ranges.  Raises ValueError
+        for invalid boundaries, overlaps, or surrogate-pair splits.
+        """
+        if not ranges:
+            return []
+        norm = []
+        for r in ranges:
+            if not isinstance(r, (tuple, list)) or len(r) != 2:
+                raise ValueError(
+                    f'invalid mask range {r!r}: expected a (start, end) pair')
+            start, end = r
+            if not isinstance(start, int) or not isinstance(end, int) or \
+                    isinstance(start, bool) or isinstance(end, bool):
+                raise ValueError(
+                    f'invalid mask range {r!r}: start and end must be integers')
+            norm.append((start, end))
+        norm.sort()
+        result = []
+        for start, end in norm:
+            if start < 0 or end < 0:
+                raise ValueError(
+                    f'invalid mask range ({start}, {end}): negative offset')
+            if start > end:
+                raise ValueError(
+                    f'invalid mask range ({start}, {end}): start > end')
+            if end > len(source):
+                raise ValueError(
+                    f'invalid mask range ({start}, {end}): end {end} exceeds '
+                    f'source length {len(source)}')
+            if start == end:
+                # empty range: masks nothing, no effect
+                continue
+            if result and start < result[-1][1]:
+                raise ValueError(
+                    f'overlapping mask ranges: {result[-1]} and ({start}, {end})')
+            for b in (start, end):
+                if self._splits_surrogate_pair(source, b):
+                    raise ValueError(
+                        f'mask range ({start}, {end}) splits a Unicode '
+                        f'surrogate pair at offset {b}')
+            result.append((start, end))
+        return result
+
+    def filter(self, lexer, stream):
+        # Reset mapping first so that a failed validation leaves it empty.
+        self.mapping = []
+        # Buffer the stream so that validation happens before any output is
+        # produced (errors never deliver partial masking).
+        tokens = list(stream)
+        source = ''.join(value for _, value in tokens)
+        ranges = self._validate_ranges(self.ranges, source)
+
+        out_pos = 0   # current position in the output
+        src_pos = 0   # current position in the source
+        ri = 0        # index into the sorted ranges
+        for ttype, value in tokens:
+            tok_start = src_pos
+            tok_end = src_pos + len(value)
+            pos = 0  # position within this token's value
+
+            # skip ranges entirely before this token
+            while ri < len(ranges) and ranges[ri][1] <= tok_start:
+                ri += 1
+
+            # process ranges overlapping this token
+            while ri < len(ranges) and ranges[ri][0] < tok_end:
+                rs, re = ranges[ri]
+                m_start = max(rs, tok_start)
+                m_end = min(re, tok_end)
+                # plain part before the masked range
+                plain_start = pos
+                plain_end = m_start - tok_start
+                if plain_end > plain_start:
+                    text = value[plain_start:plain_end]
+                    yield ttype, text
+                    self.mapping.append((out_pos, out_pos + len(text),
+                                         tok_start + plain_start,
+                                         tok_start + plain_end, ttype))
+                    out_pos += len(text)
+                # masked part
+                yield self.mask_ttype, self.replacement
+                self.mapping.append((out_pos, out_pos + len(self.replacement),
+                                     m_start, m_end, self.mask_ttype))
+                out_pos += len(self.replacement)
+                pos = m_end - tok_start
+                if re <= tok_end:
+                    ri += 1
+                else:
+                    break
+
+            # plain part after the last masked range
+            if pos < len(value):
+                text = value[pos:]
+                yield ttype, text
+                self.mapping.append((out_pos, out_pos + len(text),
+                                     tok_start + pos, tok_end, ttype))
+                out_pos += len(text)
+            src_pos = tok_end
+
+
 FILTERS = {
     'codetagify':     CodeTagFilter,
     'keywordcase':    KeywordCaseFilter,
@@ -939,4 +1118,5 @@ FILTERS = {
     'gobble':         GobbleFilter,
     'tokenmerge':     TokenMergeFilter,
     'symbols':        SymbolFilter,
+    'mask':           TokenStreamMasker,
 }
