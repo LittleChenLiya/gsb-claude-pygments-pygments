@@ -868,3 +868,51 @@ contribute a new lexer, but you might find it useful in any case.
          (r'[^*]+', Comment.Multiline),
          (r'\*', Comment.Multiline),
      ]
+
+Error tracking
+==============
+
+Pygments provides an explicit error list for lexers.  The
+:class:`~pygments.lexer.LexerErrors` class records source line/column,
+lexer state and absolute byte range for every ``Token.Error`` token the
+lexer emits — without scanning the token stream a second time.  Normal
+Error tokens are still yielded as usual (they are not removed).
+
+To enable error tracking, pass a :class:`~pygments.lexer.LexerErrors`
+object to :meth:`~pygments.lexer.Lexer.get_tokens`::
+
+    from pygments.lexer import LexerErrors
+
+    errors = LexerErrors()
+    for token_type, value in lexer.get_tokens(source, errors=errors):
+        ...
+
+    for record in errors.records:
+        print(record.line, record.column, record.state, record.pos, record.end)
+
+Each record is an :class:`~pygments.lexer.ErrorRecord` with ``line``,
+``column``, ``state``, ``pos`` and ``end`` attributes.  The ``state`` is
+only recorded if it is a publicly nameable state (a string that does not
+start with an underscore); combined states that use generated private
+names are recorded as ``None``.
+
+The collector only inspects the token type and position; the token text
+is never stored.  If the lexer itself raises an exception (as opposed to
+emitting an Error token), the exception is recorded separately in
+``errors.exception`` together with the ``errors.exception_stage`` at
+which it occurred (e.g. ``'lexing'``).
+
+Adjacent errors can optionally be merged into a single record spanning
+the whole range.  Pass ``merge_adjacent=True`` to
+:class:`~pygments.lexer.LexerErrors` to enable this.
+
+For incremental lexing, :func:`~pygments.lexer.lex_incremental` lexes a
+sequence of segments while preserving the lexer state and absolute
+positions across segments.  The error positions match a one-time lex of
+the concatenated source::
+
+    from pygments.lexer import lex_incremental
+
+    tokens, errors = lex_incremental(lexer, [segment1, segment2])
+
+This is useful for lexing large texts in chunks without rescanning.

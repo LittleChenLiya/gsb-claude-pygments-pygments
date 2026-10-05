@@ -12,16 +12,38 @@ import re
 import sys
 import time
 
-from pygments.filter import apply_filters, Filter
+from pygments.errors import ErrorRecord, LexerErrors
+from pygments.filter import Filter, apply_filters
 from pygments.filters import get_filter_by_name
-from pygments.token import Error, Text, Other, Whitespace, _TokenType
-from pygments.util import get_bool_opt, get_int_opt, get_list_opt, \
-    make_analysator, Future, guess_decode
 from pygments.regexopt import regex_opt
+from pygments.token import Error, Other, Text, Whitespace, _TokenType
+from pygments.util import (
+    Future,
+    get_bool_opt,
+    get_int_opt,
+    get_list_opt,
+    guess_decode,
+    make_analysator,
+)
 
-__all__ = ['Lexer', 'RegexLexer', 'ExtendedRegexLexer', 'DelegatingLexer',
-           'LexerContext', 'include', 'inherit', 'bygroups', 'using', 'this',
-           'default', 'words', 'line_re']
+__all__ = [
+    'DelegatingLexer',
+    'ErrorRecord',
+    'ExtendedRegexLexer',
+    'Lexer',
+    'LexerContext',
+    'LexerErrors',
+    'RegexLexer',
+    'bygroups',
+    'default',
+    'include',
+    'inherit',
+    'lex_incremental',
+    'line_re',
+    'this',
+    'using',
+    'words',
+]
 
 line_re = re.compile('.*?\n')
 
@@ -171,6 +193,10 @@ class Lexer(metaclass=LexerMeta):
         self.filters = []
         for filter_ in get_list_opt(options, 'filters', ()):
             self.add_filter(filter_)
+        # Optional observer called for every Error token emitted while
+        # error tracking is active (see get_tokens()).  It is a callable
+        # ``(pos, tokentype, state)`` or ``None``.
+        self._error_observer = None
 
     def __repr__(self):
         if self.options:
@@ -230,11 +256,9 @@ class Lexer(metaclass=LexerMeta):
                 text = decoded
             else:
                 text = text.decode(self.encoding)
-                if text.startswith('\ufeff'):
-                    text = text[len('\ufeff'):]
+                text = text.removeprefix('\ufeff')
         else:
-            if text.startswith('\ufeff'):
-                text = text[len('\ufeff'):]
+            text = text.removeprefix('\ufeff')
 
         # text now *is* a unicode string
         text = text.replace('\r\n', '\n')
@@ -250,7 +274,7 @@ class Lexer(metaclass=LexerMeta):
 
         return text
 
-    def get_tokens(self, text, unfiltered=False):
+    def get_tokens(self, text, unfiltered=False, errors=None):
         """
         This method is the basic interface of a lexer. It is called by
         the `highlight()` function. It must process the text and return an
@@ -263,16 +287,69 @@ class Lexer(metaclass=LexerMeta):
 
         If `unfiltered` is set to `True`, the filtering mechanism is
         bypassed even if filters are defined.
+
+        If `errors` is given, it must be a `LexerErrors` object.  It is
+        bound to the (preprocessed) source text and an error record is
+        produced for every `Token.Error` token the lexer emits — the token
+        stream is not scanned a second time.  Normal Error tokens are still
+        yielded as usual (they are not removed).  Only the token type and
+        position are inspected; the token text is not stored.  If the lexer
+        raises an exception, it is recorded in `errors` separately from the
+        Error token records, together with the stage at which it occurred.
         """
-        text = self._preprocess_lexer_input(text)
+        try:
+            text = self._preprocess_lexer_input(text)
+        except Exception as e:
+            if errors is not None:
+                errors.record_exception(e, 'preprocessing')
+            raise
+        if errors is not None:
+            errors.bind(text)
 
         def streamer():
-            for _, t, v in self.get_tokens_unprocessed(text):
-                yield t, v
+            # ``state_recorded`` is set by the observer when the lexer
+            # records an error with state.  The streamer then skips its
+            # own observation for that token (to avoid double recording).
+            state_recorded = [False]
+
+            def observer(pos, ttype, state=None):
+                state_recorded[0] = True
+                errors.observe(pos, ttype, state)
+
+            self._error_observer = observer if errors is not None else None
+            try:
+                for index, t, v in self.get_tokens_unprocessed(text):
+                    if errors is not None:
+                        if state_recorded[0]:
+                            # The lexer already recorded this error with state.
+                            state_recorded[0] = False
+                        else:
+                            errors.observe(index, t, None)
+                    yield t, v
+            except Exception as e:
+                if errors is not None:
+                    errors.record_exception(e, 'lexing')
+                raise
+            finally:
+                self._error_observer = None
         stream = streamer()
         if not unfiltered:
             stream = apply_filters(stream, self.filters, self)
         return stream
+
+    def get_errors(self, text, unfiltered=False):
+        """
+        Lex `text` and return the `LexerErrors` collected.
+
+        This is a convenience wrapper around `get_tokens()` with error
+        tracking enabled.  The token stream is consumed fully; error
+        records are produced from the emitted `Token.Error` tokens.  If the
+        lexer raises an exception, it is recorded in the returned object
+        (in ``exception`` and ``exception_stage``) and re-raised.
+        """
+        errors = LexerErrors()
+        list(self.get_tokens(text, unfiltered=unfiltered, errors=errors))
+        return errors
 
     def get_tokens_unprocessed(self, text):
         """
@@ -329,7 +406,6 @@ class include(str):  # pylint: disable=invalid-name
     """
     Indicates that a state should include rules from another state.
     """
-    pass
 
 
 class _inherit:
@@ -755,10 +831,20 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
                         yield pos, Whitespace, '\n'
                         pos += 1
                         continue
+                    if self._error_observer is not None:
+                        state = statestack[-1]
+                        if isinstance(state, str) and state.startswith('_'):
+                            # combined states use generated private names;
+                            # only publicly nameable states are recorded
+                            state = None
+                        self._error_observer(pos, Error, state)
                     yield pos, Error, text[pos]
                     pos += 1
                 except IndexError:
                     break
+        # Keep the final state stack so that incremental lexing can resume
+        # where this segment left off.
+        self._statestack = statestack
 
 
 class LexerContext:
@@ -842,10 +928,20 @@ class ExtendedRegexLexer(RegexLexer):
                         yield ctx.pos, Text, '\n'
                         ctx.pos += 1
                         continue
+                    if self._error_observer is not None:
+                        state = ctx.stack[-1]
+                        if isinstance(state, str) and state.startswith('_'):
+                            # combined states use generated private names;
+                            # only publicly nameable states are recorded
+                            state = None
+                        self._error_observer(ctx.pos, Error, state)
                     yield ctx.pos, Error, text[ctx.pos]
                     ctx.pos += 1
                 except IndexError:
                     break
+        # Keep the final state stack so that incremental lexing can resume
+        # where this segment left off.
+        self._statestack = ctx.stack
 
 
 def do_insertions(insertions, tokens):
@@ -910,6 +1006,73 @@ def do_insertions(insertions, tokens):
         except StopIteration:
             insleft = False
             break  # not strictly necessary
+
+
+def _offset_observer(errors, offset):
+    """Return an error observer that adds an absolute ``offset`` to positions."""
+    def observe(pos, ttype, state=None):
+        errors.observe(pos + offset, ttype, state)
+    return observe
+
+
+def lex_incremental(lexer, segments, errors=None):
+    """
+    Lex a sequence of ``segments`` incrementally.
+
+    The lexer's state (state stack) and absolute positions persist across
+    segments, so the result is the same as lexing the concatenation of all
+    segments at once.  This is useful for lexing large texts in chunks
+    without rescanning.
+
+    ``segments`` is an iterable of strings.  Each segment is lexed in
+    order, starting from the state the previous segment ended in.  Error
+    records are produced from the emitted `Token.Error` tokens with
+    absolute positions (relative to the concatenated source), so the error
+    positions match a one-time lex of the full text.
+
+    Returns a tuple ``(tokens, errors)`` where ``tokens`` is a list of
+    ``(tokentype, value)`` pairs (in the same order as a one-time lex) and
+    ``errors`` is the `LexerErrors` object.  If ``errors`` is given, it is
+    bound to the concatenated source and reused; otherwise a new
+    `LexerErrors` is created.
+
+    Note: for the error positions to match a one-time lex, the segments
+    should be split at a point where the lexer state is consistent (e.g.
+    at a newline boundary).
+    """
+    if errors is None:
+        errors = LexerErrors()
+    full_text = ''.join(segments)
+    errors.bind(full_text)
+    is_regex = isinstance(lexer, RegexLexer)
+    is_extended = isinstance(lexer, ExtendedRegexLexer)
+    stack = ['root']
+    offset = 0
+    tokens = []
+    for segment in segments:
+        if is_extended:
+            ctx = LexerContext(segment, 0, stack=list(stack))
+            lexer._error_observer = _offset_observer(errors, offset)
+            try:
+                for index, t, v in lexer.get_tokens_unprocessed(segment, context=ctx):
+                    tokens.append((t, v))
+            finally:
+                lexer._error_observer = None
+            stack = ctx.stack
+        elif is_regex:
+            lexer._error_observer = _offset_observer(errors, offset)
+            try:
+                for index, t, v in lexer.get_tokens_unprocessed(segment, stack=stack):
+                    tokens.append((t, v))
+            finally:
+                lexer._error_observer = None
+            stack = lexer._statestack
+        else:
+            for index, t, v in lexer.get_tokens_unprocessed(segment):
+                errors.observe(index + offset, t, None)
+                tokens.append((t, v))
+        offset += len(segment)
+    return tokens, errors
 
 
 class ProfilingRegexLexerMeta(RegexLexerMeta):

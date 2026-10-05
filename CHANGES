@@ -7,6 +7,16 @@ Version 2.22.0
 --------------
 (not released yet)
 
+- Added explicit error tracking for lexers.  The new ``LexerErrors``
+  class (and the ``errors`` parameter of ``Lexer.get_tokens()``) records
+  source line/column, lexer state and absolute byte range for every
+  ``Token.Error`` token the lexer emits — without a second scan.  Normal
+  Error tokens are still yielded.  Lexer exceptions are recorded
+  separately with the stage at which they occurred.  Adjacent errors can
+  optionally be merged.  The new ``lex_incremental()`` function lexes
+  segments incrementally while preserving state and absolute positions,
+  so error positions match a one-time lex.
+
 Version 2.21.0
 ---------------
 (released August 17th, 2026)
