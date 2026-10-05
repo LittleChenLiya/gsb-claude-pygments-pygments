@@ -7,6 +7,19 @@ Version 2.22.0
 --------------
 (not released yet)
 
+- API changes:
+
+  * Added an explicit lexing-error list.  ``Lexer.get_tokens()`` now fills
+    ``lexer.errors`` with :class:`~pygments.lexer.LexerErrorItem` records
+    (source line/column, public state and byte range) built from the
+    ``Token.Error`` tokens the single lexing pass emits; the tokens
+    themselves remain in the stream.  New options ``merge_adjacent_errors``
+    and ``error_callback`` control merging and a type/position-only
+    callback.  Lexer exceptions are recorded separately (with the failing
+    stage in ``lexer.failed_stage``).  Added
+    :class:`~pygments.lexer.IncrementalLexer` for segmented lexing with
+    continuous state and absolute positions.
+
 Version 2.21.0
 ---------------
 (released August 17th, 2026)

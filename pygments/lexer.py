@@ -8,6 +8,8 @@
     :license: BSD, see LICENSE for details.
 """
 
+import bisect
+import contextvars
 import re
 import sys
 import time
@@ -19,11 +21,60 @@ from pygments.util import get_bool_opt, get_int_opt, get_list_opt, \
     make_analysator, Future, guess_decode
 from pygments.regexopt import regex_opt
 
-__all__ = ['Lexer', 'RegexLexer', 'ExtendedRegexLexer', 'DelegatingLexer',
+__all__ = ['Lexer', 'LexerErrorItem', 'ErrorCollector', 'IncrementalLexer',
+           'RegexLexer', 'ExtendedRegexLexer', 'DelegatingLexer',
            'LexerContext', 'include', 'inherit', 'bygroups', 'using', 'this',
            'default', 'words', 'line_re']
 
 line_re = re.compile('.*?\n')
+
+#: Context variable holding the :class:`ErrorCollector` for the lexing run
+#: currently in progress (if any).  This is a context variable rather than a
+#: plain attribute so that tokens produced by nested lexers, e.g. through the
+#: :func:`using` callback or :class:`DelegatingLexer`, are attributed to the
+#: outer run as well.
+_current_error_collector = contextvars.ContextVar(
+    'pygments_lexer_error_collector', default=None)
+
+#: Context variable holding the state stack of the lexer currently emitting
+#: a token.  It lets error-reporting code (including delegating lexers) see
+#: which state produced a token without rescanning anything.
+_current_state_stack = contextvars.ContextVar(
+    'pygments_lexer_state_stack', default=('root',))
+
+#: Sink :class:`LexerContext` that should receive the final state stack of a
+#: base :class:`RegexLexer` run started through the public ``stack``
+#: argument.  Used internally by :class:`IncrementalLexer`.
+_state_sink = contextvars.ContextVar(
+    'pygments_lexer_state_sink', default=None)
+
+
+def _is_error_token(token_type):
+    """True for ``Token.Error`` and its own subtypes (not ``Generic.Error``)."""
+    return Error in token_type
+
+
+def _emit_error_token(pos, token_type, value, stack, nested_depth=0):
+    """Record ``(pos, token_type, value)`` as an error if a collector asks.
+
+    Error tokens emitted by a nested ``using()`` run (its own frame depth is
+    at least ``nested_depth``) are skipped here: they surface again in the
+    outer action iterator where they get recorded with the outer state.
+    Returns the item unchanged so callers keep yielding it normally.
+    """
+    _current_state_stack.set(stack)
+    collector = _current_error_collector.get()
+    if (collector is not None and _is_error_token(token_type)
+            and collector.frame_depth == nested_depth):
+        collector.record_error_token(pos, token_type, value, stack)
+    return pos, token_type, value
+
+
+def _record_loop_exception(pos, stack, stage, error):
+    """Attribute ``error`` to the failing lexer, if a collector is active."""
+    collector = _current_error_collector.get()
+    if collector is not None and not collector.exception_recorded:
+        collector.record_exception(pos, stack, stage, error)
 
 _encoding_map = [(b'\xef\xbb\xbf', 'utf-8'),
                  (b'\xff\xfe\0\0', 'utf-32'),
@@ -32,6 +83,362 @@ _encoding_map = [(b'\xef\xbb\xbf', 'utf-8'),
                  (b'\xfe\xff', 'utf-16be')]
 
 _default_analyse = staticmethod(lambda x: 0.0)
+
+
+# ------------------------------------------------------------------------------
+# Explicit error reporting
+#
+
+
+class LexerErrorItem:
+    """
+    A single entry in the explicit error list produced while lexing.
+
+    Instances are immutable.  Two kinds of entries exist, distinguished by
+    :attr:`origin`:
+
+    ``'token'``
+       The entry describes a normal ``Token.Error`` (or a subtype of it)
+       emitted by the lexer.  The token itself remains part of the regular
+       token stream; recording it does not delete or replace it.
+    ``'exception'``
+       The lexer itself raised an exception instead of producing an error
+       token.  :attr:`error` holds the exception object and :attr:`stage`
+       names the phase that failed (``'match'`` while trying a state rule or
+       ``'action'`` while running a rule callback).
+
+    Positions refer to the *preprocessed* text actually lexed (that is the
+    text handed to :meth:`Lexer.get_tokens_unprocessed`, or to the
+    concatenation of the segments fed to an :class:`IncrementalLexer`):
+
+    * :attr:`start` / :attr:`end` form the zero-based half-open character
+      (byte, for ``str``) range covered by the error.
+    * :attr:`line` is the one-based source line and :attr:`column` the
+      zero-based column of :attr:`start`.
+    * :attr:`state` is a tuple of the *public* state names on the state
+      stack at the point of failure (internal states whose name starts with
+      ``_`` are hidden).
+
+    .. versionadded:: 3.0
+    """
+
+    __slots__ = ('origin', 'token_type', 'start', 'end', 'line', 'column',
+                 'state', 'stage', 'error')
+
+    def __init__(self, origin, start, end, line, column, state,
+                 token_type=None, stage=None, error=None):
+        #: ``'token'`` for an emitted error token, ``'exception'`` for a
+        #: lexer failure.
+        self.origin = origin
+        #: The token type for ``origin == 'token'``, else ``None``.
+        self.token_type = token_type
+        #: Start position of the error in the lexed text (inclusive).
+        self.start = start
+        #: End position of the error in the lexed text (exclusive).
+        self.end = end
+        #: One-based line of :attr:`start`.
+        self.line = line
+        #: Zero-based column of :attr:`start`.
+        self.column = column
+        #: Tuple of public state names active when the error occurred.
+        self.state = tuple(state)
+        #: Failure phase for ``origin == 'exception'``
+        #: (``'match'`` or ``'action'``); else ``None``.
+        self.stage = stage
+        #: The exception object for ``origin == 'exception'``.
+        self.error = error
+
+    def __repr__(self):
+        if self.origin == 'token':
+            detail = f'{self.token_type}'
+        else:
+            detail = f'{self.stage}: {self.error!r}'
+        return (f'LexerErrorItem({self.origin!r}, {detail}, '
+                f'line={self.line}, column={self.column}, '
+                f'start={self.start}, end={self.end}, state={self.state!r})')
+
+    def __eq__(self, other):
+        if not isinstance(other, LexerErrorItem):
+            return NotImplemented
+        return (self.origin == other.origin
+                and self.token_type == other.token_type
+                and self.start == other.start and self.end == other.end
+                and self.line == other.line and self.column == other.column
+                and self.state == other.state and self.stage == other.stage
+                and self.error == other.error)
+
+
+def _public_stack(stack):
+    """Return only the publicly named states of a state stack."""
+    return tuple(name for name in stack if not str(name).startswith('_'))
+
+
+class ErrorCollector:
+    """
+    Collects an explicit list of lexing errors while a lexer runs.
+
+    The collector observes the token stream the lexer already produces; it
+    never rescans the source itself.  It supports both one-shot lexing
+    (through :meth:`Lexer.get_tokens`) and incremental, segmented lexing
+    (through :class:`IncrementalLexer`): positions, line/column counters and
+    the state stack are kept across segments.
+
+    Options:
+
+    ``merge_adjacent_errors``
+        If true, error tokens with adjacent byte ranges are merged into a
+        single record.  If false (the default), every emitted error token is
+        recorded separately.
+    ``error_callback``
+        Optional callable invoked once per recorded error token.  It is
+        called with the keyword arguments ``token_type``, ``start``, ``end``,
+        ``line``, ``column`` and ``state`` only -- it deliberately never
+        receives the error text, so callbacks cannot depend on (or leak) the
+        offending source.  The callback is invoked before the token is
+        merged, i.e. once per emitted error token.
+
+    .. versionadded:: 3.0
+    """
+
+    def __init__(self, text, merge_adjacent_errors=False, error_callback=None,
+                 base_offset=0, base_line=1, base_column=0):
+        # ``text`` is the text that is about to be lexed.  It is only read
+        # lazily at positions the lexer has already reached, so line/column
+        # computation stays part of the single lexing pass.
+        self.text = text
+        self.merge_adjacent_errors = merge_adjacent_errors
+        self.error_callback = error_callback
+        #: Absolute offset of ``text[0]`` within the concatenation of all
+        #: segments seen so far.
+        self.base_offset = base_offset
+        #: Line/column at ``text[0]``.
+        self.base_line = base_line
+        self.base_column = base_column
+        #: The collected :class:`LexerErrorItem` objects.
+        self.errors = []
+        # Offsets of nested ``using()`` runs on top of ``base_offset``.
+        self._frames = []
+        # Set once an exception has been recorded for the exception currently
+        # propagating, so outer loops do not attribute it a second time.
+        self.exception_recorded = False
+        # Positions just past newlines within the *absolute* coordinate
+        # system, built up lazily as the lexer advances.
+        self._newline_ends = []
+        # Absolute position up to which newlines have been counted.
+        self._newlines_scanned_to = base_offset
+        self._token = None
+
+    @property
+    def frame_depth(self):
+        """Number of nested ``using()`` runs currently active."""
+        return len(self._frames)
+
+    def push_frame(self, offset):
+        """Begin a nested lexer run (see the :func:`using` callback)."""
+        self._frames.append(offset)
+        return len(self._frames)
+
+    def pop_frame(self, depth):
+        """End a nested lexer run opened with :meth:`push_frame`."""
+        while len(self._frames) >= depth:
+            self._frames.pop()
+
+    def suspend(self):
+        """Temporarily disable recording (used by `DelegatingLexer`)."""
+        return _current_error_collector.set(None)
+
+    @staticmethod
+    def restore(token):
+        """Restore the previously active collector (see :meth:`activate`)."""
+        _current_error_collector.reset(token)
+
+    def activate(self):
+        """Make this collector the active one for a lexing run."""
+        return _current_error_collector.set(self)
+
+    def _absolute(self, pos):
+        return self.base_offset + sum(self._frames) + pos
+
+    def advance_to(self, pos):
+        """Count newlines up to absolute position ``pos`` (one pass only)."""
+        if pos > self._newlines_scanned_to:
+            segment = self.text[self._newlines_scanned_to - self.base_offset:
+                                pos - self.base_offset]
+            start = 0
+            while True:
+                nl = segment.find('\n', start)
+                if nl < 0:
+                    break
+                self._newline_ends.append(
+                    self._newlines_scanned_to + nl + 1)
+                start = nl + 1
+            self._newlines_scanned_to = pos
+
+    def _line_column(self, start):
+        self.advance_to(start)
+        idx = bisect.bisect_right(self._newline_ends, start)
+        if idx == 0:
+            return self.base_line, start - self.base_offset + self.base_column
+        line_start = self._newline_ends[idx - 1]
+        return self.base_line + idx, start - line_start
+
+    def record_error_token(self, pos, token_type, value, stack):
+        """Record an error token emitted at (possibly nested) position ``pos``."""
+        # Called by the RegexLexer/ExtendedRegexLexer main loops.  ``pos`` is
+        # local to the innermost (possibly nested) run; segment and nested
+        # frames are added to obtain the absolute position.
+        start = self._absolute(pos)
+        self._record_at(start, token_type, len(value), stack)
+
+    def record_error_absolute(self, start, token_type, value, stack):
+        """Record an error token already at an absolute position."""
+        self._record_at(start, token_type, len(value), stack)
+
+    def _record_at(self, start, token_type, length, stack):
+        end = start + length
+        line, column = self._line_column(start)
+        state = _public_stack(stack)
+
+        if self.error_callback is not None:
+            self.error_callback(token_type=token_type, start=start, end=end,
+                                line=line, column=column, state=state)
+
+        if (self.merge_adjacent_errors and self.errors
+                and self.errors[-1].origin == 'token'
+                and self.errors[-1].end == start
+                and self.errors[-1].state == state
+                and self.errors[-1].token_type == token_type):
+            prev = self.errors[-1]
+            self.errors[-1] = LexerErrorItem(
+                'token', prev.start, end, prev.line, prev.column, state,
+                token_type=token_type)
+        else:
+            self.errors.append(LexerErrorItem(
+                'token', start, end, line, column, state,
+                token_type=token_type))
+
+    def record_exception(self, pos, stack, stage, error):
+        """Record a lexer exception raised near (nested) position ``pos``."""
+        start = self._absolute(pos)
+        line, column = self._line_column(start)
+        self.exception_recorded = True
+        self.errors.append(LexerErrorItem(
+            'exception', start, start, line, column, _public_stack(stack),
+            stage=stage, error=error))
+
+    def tail_position(self):
+        """Return ``(offset, line, column)`` just past the consumed text."""
+        end = self.base_offset + len(self.text)
+        self.advance_to(end)
+        idx = len(self._newline_ends)
+        if idx == 0:
+            return end, self.base_line, end - self.base_offset + self.base_column
+        return end, self.base_line + idx, end - self._newline_ends[-1]
+
+
+class IncrementalLexer:
+    """
+    Feed source code to a lexer in several segments while keeping continuous
+    state and absolute positions.
+
+    ``lexer`` is a `RegexLexer` or `ExtendedRegexLexer` instance.  Each call
+    to :meth:`feed` lexes one segment, continuing exactly where the previous
+    segment ended (the state stack persists, including unmatched constructs
+    at a segment boundary).  Returned positions and the positions in
+    :attr:`errors` are absolute offsets within the concatenation of all
+    segments -- identical to lexing the whole source at once.
+
+    The input is *not* preprocessed (no newline normalization, stripping or
+    trailing-newline insertion); feed already-normalized text to keep the
+    reported positions aligned with your source.
+
+    To obtain exactly the same tokens (and error positions) as a single
+    one-shot lexing run, split the source at token boundaries (positions
+    where the lexer has caught up with the end of a segment) and call
+    :meth:`feed` once per segment; then :meth:`finish` to lex the final
+    segment with end-of-input handling enabled.
+
+    Options are the same as for :class:`ErrorCollector`
+    (``merge_adjacent_errors`` and ``error_callback``).
+
+    .. versionadded:: 3.0
+    """
+
+    def __init__(self, lexer, merge_adjacent_errors=False, error_callback=None):
+        self.lexer = lexer
+        self.merge_adjacent_errors = merge_adjacent_errors
+        self.error_callback = error_callback
+        #: All errors accumulated across the segments, in order.
+        self.errors = []
+        # Length and line/column of everything already lexed.
+        self._offset = 0
+        self._line = 1
+        self._column = 0
+        # Continuous lexer state, reused for every segment.
+        self._context = LexerContext('', 0)
+        # Initial stack for the next segment.
+        self._stack = ['root']
+
+    @property
+    def state(self):
+        """The current public state stack (a tuple of public state names)."""
+        return _public_stack(self._stack)
+
+    def feed(self, segment):
+        """Lex one non-final ``segment``; yield absolute ``(i, t, v)``.
+
+        The segment is lexed with end-of-input disabled: tokens that would
+        need more input (e.g. an unterminated comment) stay in the current
+        state and are resolved when more text or :meth:`finish` arrives.
+        """
+        return self._run(segment, end_input=False)
+
+    def finish(self, segment=''):
+        """Lex the final ``segment`` with end-of-input handling enabled."""
+        return self._run(segment, end_input=True)
+
+    def _run(self, segment, end_input):
+        collector = ErrorCollector(
+            segment, self.merge_adjacent_errors, self.error_callback,
+            base_offset=self._offset, base_line=self._line,
+            base_column=self._column)
+        collector.errors = self.errors
+
+        ctx = self._context
+        ctx.text = segment
+        ctx.pos = 0
+        # One past the last position that may be consumed in this run.  For
+        # a non-final segment this hides the end of the segment from the
+        # loop, so EOF-only fallback rules do not fire there; for the final
+        # segment it exposes it.
+        ctx.end = len(segment) if end_input else len(segment) + 1
+        # A fresh list per run: the loop rebinds it on newline root resets,
+        # and the sink publishes whichever list ended up as the final stack.
+        ctx.stack = list(self._stack)
+
+        token = collector.activate()
+        try:
+            if isinstance(self.lexer, ExtendedRegexLexer):
+                stream = self.lexer.get_tokens_unprocessed(context=ctx)
+            else:
+                _state_sink.set(ctx)
+                try:
+                    stream = self.lexer.get_tokens_unprocessed(
+                        segment, stack=tuple(self._stack))
+                    for local_pos, ttype, value in stream:
+                        yield self._offset + local_pos, ttype, value
+                finally:
+                    _state_sink.set(None)
+                return
+            # Fully consume the generator inside the try so that exceptions
+            # raised lazily by callbacks are attributed as well.
+            for local_pos, ttype, value in stream:
+                yield self._offset + local_pos, ttype, value
+        finally:
+            collector.restore(token)
+            self._stack = list(ctx.stack)
+            self._offset, self._line, self._column = \
+                collector.tail_position()
 
 
 class LexerMeta(type):
@@ -103,6 +510,19 @@ class Lexer(metaclass=LexerMeta):
         library, if it is installed.
     ``inencoding``
         Overrides the ``encoding`` if given.
+
+    ``merge_adjacent_errors``
+        Merge error tokens with adjacent byte ranges into a single record
+        in :attr:`errors` (default: False).
+
+        .. versionadded:: 3.0
+
+    ``error_callback``
+        Optional callable invoked for each emitted error token with the
+        keyword arguments ``token_type``, ``start``, ``end``, ``line``,
+        ``column`` and ``state``.  It is never given the error text.
+
+        .. versionadded:: 3.0
     """
 
     #: Full name of the lexer, in human-readable form
@@ -168,6 +588,16 @@ class Lexer(metaclass=LexerMeta):
         self.tabsize = get_int_opt(options, 'tabsize', 0)
         self.encoding = options.get('encoding', 'guess')
         self.encoding = options.get('inencoding') or self.encoding
+        # Whether adjacent error tokens should be merged into one error
+        # record.  See ErrorCollector for the semantics.
+        self.merge_adjacent_errors = get_bool_opt(
+            options, 'merge_adjacent_errors', False)
+        # Optional callback notified for each emitted error token; it only
+        # ever sees the token type and position, never the error text.
+        self.error_callback = options.get('error_callback')
+        # Error records from the latest get_tokens() run (empty otherwise).
+        self.errors = []
+        self.failed_stage = None
         self.filters = []
         for filter_ in get_list_opt(options, 'filters', ()):
             self.add_filter(filter_)
@@ -263,12 +693,30 @@ class Lexer(metaclass=LexerMeta):
 
         If `unfiltered` is set to `True`, the filtering mechanism is
         bypassed even if filters are defined.
+
+        While the returned iterable is consumed, an explicit error list is
+        built from the ``Token.Error`` tokens the lexer actually emits and
+        made available as :attr:`errors`; the error tokens themselves remain
+        in the token stream.  No second lexing pass is made.
         """
         text = self._preprocess_lexer_input(text)
+        collector = ErrorCollector(
+            text, self.merge_adjacent_errors, self.error_callback)
+        # Reset previous run's records; the collector owns the list and fills
+        # it while the generator runs.
+        self.errors = collector.errors
+        self.failed_stage = None
 
         def streamer():
-            for _, t, v in self.get_tokens_unprocessed(text):
-                yield t, v
+            token = collector.activate()
+            try:
+                for _, t, v in self.get_tokens_unprocessed(text):
+                    yield t, v
+            finally:
+                collector.restore(token)
+                self.failed_stage = next(
+                    (item.stage for item in collector.errors
+                     if item.origin == 'exception'), None)
         stream = streamer()
         if not unfiltered:
             stream = apply_filters(stream, self.filters, self)
@@ -303,21 +751,88 @@ class DelegatingLexer(Lexer):
         Lexer.__init__(self, **options)
 
     def get_tokens_unprocessed(self, text):
+        collector = _current_error_collector.get()
         buffered = ''
         insertions = []
         lng_buffer = []
-        for i, t, v in self.language_lexer.get_tokens_unprocessed(text):
-            if t is self.needle:
-                if lng_buffer:
-                    insertions.append((len(buffered), lng_buffer))
-                    lng_buffer = []
-                buffered += v
-            else:
-                lng_buffer.append((i, t, v))
-        if lng_buffer:
-            insertions.append((len(buffered), lng_buffer))
-        return do_insertions(insertions,
-                             self.root_lexer.get_tokens_unprocessed(buffered))
+        # Automatic recording from the sublexer loops is suspended while
+        # they run, because they lex rearranged text.  Errors are recorded
+        # below from the (already split) token lists, independent of the
+        # emitted stream, so the token stream stays byte-identical to the
+        # plain do_insertions() result -- including fragments split around
+        # an insertion, which must be counted only once.
+        language_error_tokens = []
+        suspend_token = collector.suspend() if collector is not None else None
+        try:
+            for i, t, v in self.language_lexer.get_tokens_unprocessed(text):
+                if t is self.needle:
+                    if lng_buffer:
+                        insertions.append((len(buffered), lng_buffer))
+                        lng_buffer = []
+                    buffered += v
+                else:
+                    lng_buffer.append((i, t, v))
+                    if collector is not None and _is_error_token(t):
+                        language_error_tokens.append((i, t, v))
+            if lng_buffer:
+                insertions.append((len(buffered), lng_buffer))
+            root_tokens = list(
+                self.root_lexer.get_tokens_unprocessed(buffered))
+            root_stack = tuple(_current_state_stack.get())
+        finally:
+            if collector is not None:
+                _current_error_collector.reset(suspend_token)
+
+        if collector is not None:
+            # Insertion lengths in buffered order, used to map buffered
+            # offsets back onto the original text.
+            events = sorted(
+                (index, sum(len(v) for _, _, v in tokens))
+                for index, tokens in insertions)
+
+            def original_ranges(start, length):
+                """Map a buffered ``[start, start+length)`` error range to
+                the contiguous original-text subranges, omitting the
+                language content inserted into it."""
+                end = start + length
+                if length == 0:
+                    return []
+                # Length of insertions strictly before a buffered offset.
+                insert_before = 0
+                subranges = []
+                cursor = start
+                for bpos, blen in events:
+                    if bpos <= start:
+                        # wholly before the run; its length offsets later
+                        # positions
+                        insert_before += blen
+                        continue
+                    if bpos >= end:
+                        break
+                    # The part [cursor, bpos) precedes this insertion.
+                    if bpos > cursor:
+                        subranges.append(
+                            (cursor + insert_before,
+                             bpos + insert_before))
+                    insert_before += blen
+                    cursor = bpos
+                subranges.append(
+                    (cursor + insert_before, end + insert_before))
+                return [(a, b) for a, b in subranges if b > a]
+
+            for i, t, v in root_tokens:
+                if not _is_error_token(t):
+                    continue
+                for ostart, oend in original_ranges(i, len(v)):
+                    collector.record_error_absolute(
+                        ostart, t, v, root_stack)
+            # Language tokens already carry original-text positions.
+            for ostart, otype, ovalue in language_error_tokens:
+                collector.record_error_absolute(
+                    ostart, otype, ovalue, root_stack)
+
+        # Use the already-produced root tokens (no second lexing pass).
+        return do_insertions(insertions, iter(root_tokens))
 
 
 # ------------------------------------------------------------------------------
@@ -450,8 +965,15 @@ def using(_other, **kwargs):
             else:
                 lx = lexer
             s = match.start()
-            for i, t, v in lx.get_tokens_unprocessed(match.group(), **gt_kwargs):
-                yield i + s, t, v
+            collector = _current_error_collector.get()
+            depth = collector.push_frame(s) if collector is not None else 0
+            try:
+                for i, t, v in lx.get_tokens_unprocessed(match.group(),
+                                                         **gt_kwargs):
+                    yield i + s, t, v
+            finally:
+                if collector is not None:
+                    collector.pop_frame(depth)
             if ctx:
                 ctx.pos = match.end()
     else:
@@ -462,8 +984,15 @@ def using(_other, **kwargs):
             lx = _other(**d)
 
             s = match.start()
-            for i, t, v in lx.get_tokens_unprocessed(match.group(), **gt_kwargs):
-                yield i + s, t, v
+            collector = _current_error_collector.get()
+            depth = collector.push_frame(s) if collector is not None else 0
+            try:
+                for i, t, v in lx.get_tokens_unprocessed(match.group(),
+                                                         **gt_kwargs):
+                    yield i + s, t, v
+            finally:
+                if collector is not None:
+                    collector.pop_frame(depth)
             if ctx:
                 ctx.pos = match.end()
     return callback
@@ -699,26 +1228,85 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
     #: current one.
     tokens = {}
 
-    def get_tokens_unprocessed(self, text, stack=('root',)):
+    def get_tokens_unprocessed(self, text=None, stack=('root',),
+                               context=None):
         """
         Split ``text`` into (tokentype, text) pairs.
 
-        ``stack`` is the initial stack (default: ``['root']``)
+        ``stack`` is the initial stack (default: ``['root']``).
+
+        If a :class:`LexerContext` is given as ``context``, its text,
+        position, end position and state stack are used instead.  This is
+        how :class:`IncrementalLexer` keeps the state (and absolute
+        positions) continuous across several segments of an
+        :class:`ExtendedRegexLexer`.
         """
-        pos = 0
         tokendefs = self._tokens
-        statestack = list(stack)
-        statetokens = tokendefs[statestack[-1]]
+        collector = _current_error_collector.get()
+        if context is not None:
+            text = context.text
+            pos = context.pos
+            end = context.end
+            statestack = context.stack
+            statetokens = tokendefs[statestack[-1]]
+        else:
+            pos = 0
+            end = None
+            statestack = list(stack)
+            statetokens = tokendefs[statestack[-1]]
+            sink = _state_sink.get()
+            if sink is not None:
+                # Publish the (mutated) state stack to the incremental
+                # driver without otherwise changing the loop's behavior.
+                sink.stack = statestack
+        nested_depth = collector.frame_depth if collector is not None else 0
         while 1:
             for rexmatch, action, new_state in statetokens:
-                m = rexmatch(text, pos)
+                try:
+                    if end is None:
+                        m = rexmatch(text, pos)
+                    else:
+                        m = rexmatch(text, pos, end)
+                except Exception as err:
+                    # A rule regex itself blew up; attribute the failure to
+                    # the matching phase (distinct from an Error token).
+                    _record_loop_exception(pos, statestack, 'match', err)
+                    raise
                 if m:
                     if action is not None:
                         if type(action) is _TokenType:
+                            if collector is not None and \
+                                    _is_error_token(action):
+                                _emit_error_token(
+                                    pos, action, m.group(), statestack,
+                                    nested_depth)
+                            else:
+                                _current_state_stack.set(statestack)
                             yield pos, action, m.group()
                         else:
-                            yield from action(self, m)
+                            try:
+                                items = action(self, m)
+                                # Record error tokens produced by plain
+                                # callbacks with the current state; items
+                                # coming from a nested using() run are
+                                # skipped (the frame depth changed) and get
+                                # recorded by that run's own loop.
+                                for ipos, itype, ivalue in items:
+                                    if (collector is not None
+                                            and _is_error_token(itype)
+                                            and collector.frame_depth
+                                            == nested_depth):
+                                        _emit_error_token(
+                                            ipos, itype, ivalue, statestack,
+                                            nested_depth)
+                                    yield ipos, itype, ivalue
+                            except Exception as err:
+                                _record_loop_exception(
+                                    pos, statestack, 'action', err)
+                                raise
                     pos = m.end()
+                    if context is not None:
+                        context.pos = pos
                     if new_state is not None:
                         # state transition
                         if isinstance(new_state, tuple):
@@ -743,20 +1331,33 @@ class RegexLexer(Lexer, metaclass=RegexLexerMeta):
                         else:
                             assert False, f"wrong state def: {new_state!r}"
                         statetokens = tokendefs[statestack[-1]]
+                        if context is not None:
+                            context.pos = pos
                     break
             else:
                 # We are here only if all state tokens have been considered
                 # and there was not a match on any of them.
                 try:
+                    if pos >= (end if end is not None else len(text)):
+                        break
                     if text[pos] == '\n':
                         # at EOL, reset state to "root"
                         statestack = ['root']
+                        if context is not None:
+                            context.stack = statestack
                         statetokens = tokendefs['root']
+                        _current_state_stack.set(statestack)
                         yield pos, Whitespace, '\n'
                         pos += 1
+                        if context is not None:
+                            context.pos = pos
                         continue
+                    _emit_error_token(pos, Error, text[pos], statestack,
+                                      nested_depth)
                     yield pos, Error, text[pos]
                     pos += 1
+                    if context is not None:
+                        context.pos = pos
                 except IndexError:
                     break
 
@@ -787,6 +1388,8 @@ class ExtendedRegexLexer(RegexLexer):
         If ``context`` is given, use this lexer context instead.
         """
         tokendefs = self._tokens
+        collector = _current_error_collector.get()
+        nested_depth = collector.frame_depth if collector is not None else 0
         if not context:
             ctx = LexerContext(text, 0)
             statetokens = tokendefs['root']
@@ -796,14 +1399,42 @@ class ExtendedRegexLexer(RegexLexer):
             text = ctx.text
         while 1:
             for rexmatch, action, new_state in statetokens:
-                m = rexmatch(text, ctx.pos, ctx.end)
+                try:
+                    m = rexmatch(text, ctx.pos, ctx.end)
+                except Exception as err:
+                    _record_loop_exception(ctx.pos, ctx.stack, 'match', err)
+                    raise
                 if m:
                     if action is not None:
                         if type(action) is _TokenType:
+                            if collector is not None and \
+                                    _is_error_token(action):
+                                _emit_error_token(
+                                    ctx.pos, action, m.group(), ctx.stack,
+                                    nested_depth)
+                            else:
+                                _current_state_stack.set(ctx.stack)
                             yield ctx.pos, action, m.group()
                             ctx.pos = m.end()
                         else:
-                            yield from action(self, m, ctx)
+                            try:
+                                items = action(self, m, ctx)
+                                # As in RegexLexer, record error tokens from
+                                # plain callbacks with the current state and
+                                # leave nested using() runs to their own loop.
+                                for ipos, itype, ivalue in items:
+                                    if (collector is not None
+                                            and _is_error_token(itype)
+                                            and collector.frame_depth
+                                            == nested_depth):
+                                        _emit_error_token(
+                                            ipos, itype, ivalue, ctx.stack,
+                                            nested_depth)
+                                    yield ipos, itype, ivalue
+                            except Exception as err:
+                                _record_loop_exception(
+                                    m.start(), ctx.stack, 'action', err)
+                                raise
                             if not new_state:
                                 # altered the state stack?
                                 statetokens = tokendefs[ctx.stack[-1]]
@@ -839,9 +1470,12 @@ class ExtendedRegexLexer(RegexLexer):
                         # at EOL, reset state to "root"
                         ctx.stack = ['root']
                         statetokens = tokendefs['root']
+                        _current_state_stack.set(ctx.stack)
                         yield ctx.pos, Text, '\n'
                         ctx.pos += 1
                         continue
+                    _emit_error_token(ctx.pos, Error, text[ctx.pos],
+                                      ctx.stack, nested_depth)
                     yield ctx.pos, Error, text[ctx.pos]
                     ctx.pos += 1
                 except IndexError:

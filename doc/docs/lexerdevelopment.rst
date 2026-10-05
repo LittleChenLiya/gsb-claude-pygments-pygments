@@ -760,6 +760,70 @@ The `PhpLexer` and `LuaLexer` use this method to resolve builtin functions.
 
 
 
+Reporting lexing errors
+=======================
+
+When a lexer cannot match part of its input it emits a ``Token.Error``
+token.  In addition to leaving those tokens in the regular token stream, a
+lexer can expose an explicit list of where they occurred while the single
+lexing pass runs -- the source is never scanned a second time.
+
+After consuming the stream returned by :meth:`.Lexer.get_tokens`, the
+records are available on the lexer as ``lexer.errors``; each one is a
+:class:`~pygments.lexer.LexerErrorItem` carrying the source line and
+column, the half-open byte range (``start``/``end``), the active state and
+the token type::
+
+    from pygments.lexers.python import PythonLexer
+
+    lexer = PythonLexer()
+    list(lexer.get_tokens(source))          # stream keeps its Error tokens
+    for error in lexer.errors:
+        print(error.line, error.column, error.start, error.end, error.state)
+
+Two options control the list:
+
+* ``merge_adjacent_errors=True`` merges error tokens with adjacent byte
+  ranges into a single record.  By default every emitted error token is
+  recorded separately.
+* ``error_callback`` is a callable invoked once per emitted error token
+  with the keyword arguments ``token_type``, ``start``, ``end``, ``line``,
+  ``column`` and ``state``.  It deliberately receives **no** error text.
+
+If the lexer itself raises an exception -- rather than emitting an error
+token -- the failure is recorded separately with ``origin == 'exception'``
+and a ``stage`` of ``'match'`` or ``'action'``.  The exception still
+propagates, and ``lexer.failed_stage`` names the phase that failed.  Such
+records never replace or merge with ordinary error tokens.
+
+Recorded ``state`` names only contain public states; internal states
+(whose name starts with ``_``, such as the anonymous states built by
+``combined()``) are hidden.
+
+For incremental, segmented lexing, use
+:class:`~pygments.lexer.IncrementalLexer`.  Feed each segment with
+:meth:`~pygments.lexer.IncrementalLexer.feed` and the final one with
+:meth:`~pygments.lexer.IncrementalLexer.finish`.  The state stack and the
+absolute positions stay continuous, so error positions are identical to
+lexing the concatenation of the segments at once (split the source at
+token boundaries)::
+
+    from pygments.lexer import IncrementalLexer
+
+    incremental = IncrementalLexer(PythonLexer())
+    list(incremental.feed(source[:cut]))      # non-final segments
+    list(incremental.finish(source[cut:]))    # last segment
+    print(incremental.state)                  # public state stack
+    print(incremental.errors)                 # absolute error positions
+
+A runnable demonstration on a deliberately bad string is
+``scripts/demo_lexer_errors.py``.
+
+The behavior is covered by a dedicated test module; run it with::
+
+    python -m pytest tests/test_lexer_errors.py -q
+
+
 .. _lexer-pitfalls:
 
 Common pitfalls and best practices
